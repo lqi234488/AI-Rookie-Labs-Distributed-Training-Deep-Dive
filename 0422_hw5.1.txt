@@ -1,0 +1,26 @@
+1. 在 1 台機器 8 張 GPU（具備 NVLink）的環境下，我的首選是 FSDP。
+
+2. 為什麼不一定需要 TP 或 PP？
+無需 TP (Tensor Parallel)：
+TP 主要用於處理「單層參數過大」導致單卡放不下的情況。
+雖然 7B 模型總量大，但拆解到 Transformer Layer 後，單層權重通常能輕鬆放入 80GB（甚至 40GB）的顯存中。
+TP 會引入極高頻率的通訊（每層都要 All-Reduce，在單機環境下，過度的通訊開銷往往會拖慢訓練速度。
+無需 PP (Pipeline Parallel)：
+PP 主要是為了跨越節點（Node）通訊速度慢的限制，將模型切段。
+PP 存在 Pipeline Bubble（空泡），會導致 GPU 利用率下降。
+既然我們在同一台機器內有 NVLink，通訊頻寬極高，沒必要忍受 PP 的低利用率。
+
+3. 為什麼選擇 FSDP 而不是 DDP？
+這裡有一個關鍵的記憶體計算陷阱，也是選擇 FSDP 的主因：
+記憶體壓力分析
+雖然你提到「模型大致可以放進單張 GPU，但那是針對 Inference (推論)。
+對於 Training (訓練)，情況完全不同：模型參數 (7B)：約 14GB (Half Precision)。
+梯度 (Gradients)：約 14GB。優化器狀態 (Optimizer States)：以 Adam 為例，需要存 2 份 Momentums，約 28-56GB。
+Activation (激活值)：隨著 Batch Size 增加會迅速佔據數十 GB。
+如果是 80GB 的 GPU，使用 DDP 會因為每張卡都要存一份完整的「優化器狀態」而發生 OOM (Out of Memory)。
+選擇 FSDP 的原因：消除冗餘 (Redundancy Removal)：FSDP 將優化器狀態和梯度切片分給 8 張卡，每張卡只需要負擔 1/8 的記憶體壓力，能有效避免 OOM。
+NVLink 優勢：FSDP 雖然比 DDP 多了 All-Gather 參數的通訊開銷，但在單機 NVLink 的超高頻寬下，這個開銷幾乎可以被忽略（甚至可以與計算重疊 Overlap。
+更大的 Batch Size：因為 FSDP 節省了大量顯存，我們可以開更大的 Batch Size，進而提升運算吞吐量（Throughput）。
+
+4. 總結如果你的 GPU 顯存非常充裕（例如 141GB 的 H200），DDP 會因為通訊最簡潔而最快。
+但在標準的 80GB 或更小的 GPU 環境下，FSDP 是兼顧「效能」與「記憶體容量」的最佳平衡點，且不需要像 TP/PP 那樣進行複雜的模型手動切分。
